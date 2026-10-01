@@ -48,7 +48,9 @@ public class OrderProducer {
 
         amqpTemplate.convertAndSend(orderExchangeName, orderRoutingKey, orderEvent);
        // amqpTemplate.convertAndSend(orderExchangeName, inventoryRoutingKey, orderEvent);
-       // amqpTemplate.convertAndSend(orderExchangeName, notificationRoutingKey, orderEvent);
+
+        // send event order to notification queue
+        amqpTemplate.convertAndSend(orderExchangeName, notificationRoutingKey, orderEvent);
 
         LOGGER.info("Order event published to order, inventory and notification queues for orderId: {}",
                 orderEvent.getOrder().getOrderId());

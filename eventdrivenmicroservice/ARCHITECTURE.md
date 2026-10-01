@@ -247,7 +247,69 @@ public class RabbitMQConfig {
 
 ---
 
+### 5. Message Properties
 
+Every message in RabbitMQ carries **metadata** alongside the body. These are called **Message Properties** and they travel with every message automatically.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `content-type` | String | Format of the body (e.g. `application/json`) |
+| `delivery-mode` | int | `1` = transient (memory only), `2` = persistent (disk) |
+| `correlation-id` | String | Links request to reply in RPC pattern |
+| `reply-to` | String | Queue name the server should send response to |
+| `expiration` | String | Per-message TTL in milliseconds (as a string) |
+| `message-id` | String | Unique message identifier set by the producer |
+| `timestamp` | Date | When the message was sent |
+| `headers` | Map | Custom key-value metadata you add |
+| `priority` | Integer | Message priority (0–9) |
+| `routing-key` | String | The routing key used when message was published |
+
+**In Spring AMQP:**
+```java
+// Reading properties in a listener
+@RabbitListener(queues = "order.placed.queue")
+public void consume(OrderEvent event, @Header(AmqpHeaders.CONTENT_TYPE) String contentType,
+        @Header(AmqpHeaders.MESSAGE_ID) String messageId) {
+    log.info("Content-Type: {}, Message-ID: {}", contentType, messageId);
+}
+
+// Setting properties when publishing
+MessagePostProcessor props = message -> {
+    message.getMessageProperties().setMessageId(UUID.randomUUID().toString());
+    message.getMessageProperties().setContentType("application/json");
+    message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+    return message;
+};
+amqpTemplate.convertAndSend(exchange, routingKey, orderEvent, props);
+```
+
+---
+
+### 6. Connection vs Channel — Why Two Levels?
+
+Understanding why RabbitMQ uses two layers helps you configure Spring AMQP correctly.
+
+```
+Application
+    │
+    └── TCP Connection (expensive to open — 1 per app)
+            │
+            ├── Channel 1  (lightweight — thread A's operations)
+            ├── Channel 2  (lightweight — thread B's operations)
+            └── Channel N  (lightweight — thread N's operations)
+```
+
+**Why not one connection per operation?**
+Opening a TCP connection takes 3-way handshake + TLS negotiation — ~100ms. Channels open in microseconds inside an existing connection.
+
+**Spring AMQP `CachingConnectionFactory`** manages this automatically:
+- Maintains one TCP connection (by default)
+- Pools channels for reuse — checks them out for each operation, returns them after
+- You never manage connections/channels manually in Spring Boot
+
+---
+
+## Part 2 — System Architecture & Flow
 
 ## Overview
 
@@ -519,6 +581,256 @@ Notification sent successfully for orderId: ORD-001
 | `RabbitAdmin` + `ApplicationRunner` | Forces queue/exchange declaration on startup without needing a consumer |
 | Each service owns its own DTOs | Loose coupling — services don't share code or depend on each other |
 | `@Valid` on controller input | Rejects bad requests before they reach RabbitMQ |
+
+---
+
+## Complete YAML Configuration Reference
+
+### order-service (Producer) — full application.yaml
+```yaml
+spring:
+  application:
+    name: order-service
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
+    connection-timeout: 5000
+    publisher-confirm-type: correlated   # enables publisher confirms
+    publisher-returns: true
+    template:
+      retry:
+        enabled: true
+        initial-interval: 1000
+        max-attempts: 3
+        multiplier: 1.5
+    cache:
+      channel:
+        size: 10
+server:
+  port: 8081
+
+rabbitmq:
+  exchange:
+    name: order.events.exchange
+  queue:
+    order:
+      name: order.placed.queue
+    inventory:
+      name: inventory.update.queue
+    notification:
+      name: notification.send.queue
+  routing:
+    key:
+      order: order.placed.routing.key
+      inventory: inventory.update.routing.key
+      notification: notification.send.routing.key
+```
+
+### inventory-service (Consumer) — full application.yaml
+```yaml
+spring:
+  application:
+    name: inventory-service
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
+    listener:
+      simple:
+        acknowledge-mode: auto      # change to MANUAL for fine-grained control
+        prefetch: 10
+        concurrency: 2
+        max-concurrency: 5
+        retry:
+          enabled: true
+          initial-interval: 1000
+          max-attempts: 3
+server:
+  port: 8082
+
+rabbitmq:
+  queue:
+    order:
+      name: order.placed.queue
+```
+
+### notification-service (Consumer) — full application.yaml
+```yaml
+spring:
+  application:
+    name: notification-service
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
+    listener:
+      simple:
+        acknowledge-mode: auto
+        prefetch: 10
+        concurrency: 2
+        max-concurrency: 5
+server:
+  port: 8083
+
+rabbitmq:
+  queue:
+    notification:
+      name: notification.send.queue
+```
+
+---
+
+## Troubleshooting — Common Mistakes
+
+These are the most frequent errors developers make when integrating RabbitMQ with Spring Boot.
+
+---
+
+### 1. Consumer gets raw bytes instead of object — ClassCastException or deserialization error
+
+**Symptom:**
+```
+ClassCastException: [B cannot be cast to OrderEvent
+```
+
+**Cause:** The consumer's `@RabbitListener` method is not using a `JacksonJsonMessageConverter`. Spring's default converter treats the body as bytes.
+
+**Fix:** Configure the converter in the consumer's `RabbitMQConfig`:
+```java
+@Bean
+public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+        ConnectionFactory connectionFactory) {
+    SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
+    factory.setConnectionFactory(connectionFactory);
+    factory.setMessageConverter(new JacksonJsonMessageConverter()); // ← must add this
+    return factory;
+}
+```
+
+---
+
+### 2. Queue not found or never created in RabbitMQ Management UI
+
+**Symptom:** Queue does not appear in UI at `http://localhost:15672`. Consumer throws `Queue not found`.
+
+**Cause:** The producer-only service doesn't trigger lazy auto-declaration because no consumer has connected yet.
+
+**Fix:** Add `RabbitAdmin` + `ApplicationRunner` to the producer:
+```java
+@Bean
+public ApplicationRunner rabbitInitializer(RabbitAdmin rabbitAdmin) {
+    return args -> rabbitAdmin.initialize(); // force declaration immediately
+}
+```
+
+---
+
+### 3. Poison message loops — queue fills with the same redelivered message
+
+**Symptom:** Same message ID redelivered thousands of times, consumer logs repeated errors.
+
+**Cause:** Consumer is NACKing with `requeue = true` and the root cause is never fixed.
+
+**Fix:**
+```java
+if (retryCount >= 3) {
+    channel.basicNack(tag, false, false); // requeue=false → DLX, stops the loop
+} else {
+    channel.basicNack(tag, false, true);  // retry
+}
+```
+
+---
+
+### 4. DTO field names don't match — Jackson deserialization returns null fields
+
+**Symptom:** Consumer receives event but all fields are null.
+
+**Cause:** Producer DTO uses `orderId` but consumer DTO uses `order_id`, or fields are renamed.
+
+**Fix:** Ensure both producer and consumer DTOs have **identical field names**. Since services own separate DTOs, sync them manually or use a shared event schema contract.
+
+```json
+// Publisher sends:
+{"orderId": "ORD-001", "name": "iPhone", "quantity": 2, "price": 999.99}
+
+// Consumer must have:
+private String orderId;  // ✅ matches
+private String orderid;  // ❌ null — case mismatch
+```
+
+---
+
+### 5. `guest` user cannot connect from outside localhost
+
+**Symptom:** Connection refused or authentication failed when running from Docker or a remote host.
+
+**Cause:** RabbitMQ blocks the `guest` user from connecting from any host other than `localhost` by default (security policy).
+
+**Fix:** Create a dedicated user:
+```bash
+rabbitmqctl add_user myuser mypassword
+rabbitmqctl set_user_tags myuser administrator
+rabbitmqctl set_permissions -p / myuser ".*" ".*" ".*"
+```
+
+---
+
+### 6. Exchange or queue already exists with different parameters — `PRECONDITION_FAILED`
+
+**Symptom:**
+```
+PRECONDITION_FAILED - inequivalent arg 'durable' for exchange 'order.events.exchange'
+```
+
+**Cause:** A queue or exchange was previously created with different settings (e.g., durable=false) and the application tries to re-declare it with durable=true.
+
+**Fix:** Delete the queue/exchange from the Management UI and restart. Or align the declaration parameters with what already exists.
+
+---
+
+### 7. Spring AMQP 4.x — `Jackson2JsonMessageConverter` deprecation warning
+
+**Symptom:**
+```
+Jackson2JsonMessageConverter is deprecated
+```
+
+**Cause:** `Jackson2JsonMessageConverter` was deprecated in Spring AMQP 4.0.
+
+**Fix:**
+```java
+// ❌ old (deprecated)
+return new Jackson2JsonMessageConverter();
+
+// ✅ new (Spring AMQP 4.x)
+return new JacksonJsonMessageConverter();
+```
+
+---
+
+### 8. Messages published but never consumed — wrong queue name in `@RabbitListener`
+
+**Symptom:** Producer logs show "published successfully" but consumer never receives.
+
+**Cause:** The queue name in `@RabbitListener` doesn't match the queue name the producer routes to.
+
+**Checklist:**
+```
+Producer routing key: order.placed.routing.key
+Binding key: order.placed.routing.key  ← must match
+Queue name: order.placed.queue
+
+@RabbitListener(queues = "${rabbitmq.queue.order.name}")  ← must resolve to order.placed.queue
+application.yaml: rabbitmq.queue.order.name = order.placed.queue  ← must be exact
+```
 
 ---
 
@@ -1775,7 +2087,446 @@ rabbitTemplate.setReturnsCallback(returned -> {
 
 ---
 
-### Quick Reference — 60 Questions Summary
+### Section I — Spring AMQP Deep Dive
+
+---
+
+#### Q61. What is `AmqpRejectAndDontRequeueException` and when should you throw it?
+
+**Answer:**
+`AmqpRejectAndDontRequeueException` is a Spring AMQP exception that tells the container to NACK the message with `requeue = false` — without needing manual channel access.
+
+**Use it when:** You detect a poison message or a permanent error that retrying won't fix.
+
+```java
+@RabbitListener(queues = "order.placed.queue")
+public void consume(OrderEvent event) {
+    if (event.getOrder().getOrderId() == null) {
+        throw new AmqpRejectAndDontRequeueException("orderId is null — rejecting");
+        // Spring catches this → basicNack(tag, false, false) → goes to DLX
+    }
+    processOrder(event);
+}
+```
+
+> Pair this with a DLX so the message lands somewhere instead of disappearing.
+
+---
+
+#### Q62. What is `@RabbitHandler` and when do you use it instead of `@RabbitListener`?
+
+**Answer:**
+`@RabbitHandler` is used inside a `@RabbitListener`-annotated class (not method) when one queue delivers **multiple message types**. Spring AMQP dispatches to the correct `@RabbitHandler` method based on the message's Java type.
+
+```java
+@Component
+@RabbitListener(queues = "order.placed.queue")
+public class OrderEventDispatcher {
+
+    @RabbitHandler
+    public void handleOrderCreated(OrderCreatedEvent event) {
+        log.info("Handling order created: {}", event.getOrderId());
+    }
+
+    @RabbitHandler
+    public void handleOrderCancelled(OrderCancelledEvent event) {
+        log.info("Handling order cancelled: {}", event.getOrderId());
+    }
+
+    @RabbitHandler(isDefault = true)
+    public void handleUnknown(Object unknown) {
+        log.warn("Unknown message type: {}", unknown.getClass());
+    }
+}
+```
+
+> Requires `__TypeId__` header in the message (Spring AMQP sets this automatically when publishing from Java).
+
+---
+
+#### Q63. How does Spring AMQP's built-in retry work? How is it different from DLX retry?
+
+**Answer:**
+
+**Spring AMQP built-in retry (stateless — in-memory):**
+```yaml
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        retry:
+          enabled: true
+          initial-interval: 1000   # wait 1s before first retry
+          max-attempts: 3          # try 3 times total
+          multiplier: 2.0          # exponential backoff: 1s, 2s, 4s
+```
+
+The message stays **in-flight** (not requeued) during retries. After max-attempts, Spring throws `AmqpRejectAndDontRequeueException` automatically → message goes to DLX.
+
+**DLX retry (stateful — survives restarts):**
+- Message is explicitly NACKed and re-queued via a TTL retry queue
+- Retry state survives consumer restart (message is in RabbitMQ, not application memory)
+- Better for production where retries may take minutes
+
+**Rule:** Use Spring retry for fast transient failures (milliseconds). Use DLX retry for slow retries (seconds/minutes) or when the consumer might restart.
+
+---
+
+#### Q64. What is batch message processing in Spring AMQP?
+
+**Answer:**
+Instead of processing one message at a time, the consumer can receive a **batch** (a `List<>` of messages).
+
+```java
+// Enable batching in the container factory
+factory.setBatchListener(true);
+factory.setConsumerBatchEnabled(true);
+factory.setBatchSize(10);           // process up to 10 messages per batch
+factory.setReceiveTimeout(5000);    // wait up to 5s to fill the batch
+
+// Consume as a list
+@RabbitListener(queues = "order.placed.queue")
+public void consumeBatch(List<OrderEvent> events) {
+    log.info("Processing batch of {} events", events.size());
+    orderRepository.saveAll(events.stream()
+        .map(this::toOrder)
+        .collect(Collectors.toList()));
+    // one DB call for 10 records instead of 10 separate calls
+}
+```
+
+**When to use:** Bulk database writes, bulk API calls, CSV generation — anywhere N ops are cheaper as one.
+
+---
+
+#### Q65. What is `CachingConnectionFactory` and what are its modes?
+
+**Answer:**
+`CachingConnectionFactory` is Spring AMQP's connection factory that pools connections and channels for reuse.
+
+**Two cache modes:**
+
+| Mode | Description | When |
+|------|-------------|------|
+| `CHANNEL` (default) | One TCP connection; channels are pooled | Most applications — efficient and simple |
+| `CONNECTION` | Multiple TCP connections pooled | High-throughput apps where one connection is a bottleneck |
+
+```java
+CachingConnectionFactory factory = new CachingConnectionFactory("localhost");
+factory.setCacheMode(CachingConnectionFactory.CacheMode.CHANNEL); // default
+factory.setChannelCacheSize(25); // pool up to 25 channels
+
+// In YAML:
+spring:
+  rabbitmq:
+    cache:
+      channel:
+        size: 25
+      connection:
+        mode: CHANNEL
+```
+
+---
+
+#### Q66. What is `SimpleMessageListenerContainer` vs `DirectMessageListenerContainer`?
+
+**Answer:**
+
+| | `SimpleMessageListenerContainer` | `DirectMessageListenerContainer` |
+|--|----------------------------------|----------------------------------|
+| Thread model | Fixed thread pool — each consumer gets a dedicated thread | Uses the broker's consumer thread directly (nio) |
+| Memory | More predictable | More efficient at scale |
+| Scaling | `concurrentConsumers` + `maxConcurrentConsumers` | `consumersPerQueue` |
+| Default | Yes — used by `@RabbitListener` | No — opt-in |
+
+```java
+// Use DirectMessageListenerContainer via factory
+@Bean
+public DirectRabbitListenerContainerFactory directContainerFactory(
+        ConnectionFactory connectionFactory) {
+    DirectRabbitListenerContainerFactory factory = new DirectRabbitListenerContainerFactory();
+    factory.setConnectionFactory(connectionFactory);
+    factory.setConsumersPerQueue(2); // 2 consumers per queue
+    return factory;
+}
+
+@RabbitListener(queues = "order.queue", containerFactory = "directContainerFactory")
+public void consume(OrderEvent event) { ... }
+```
+
+---
+
+#### Q67. How do you test `@RabbitListener` consumers with TestContainers in Spring Boot?
+
+**Answer:**
+TestContainers spins up a real RabbitMQ Docker container for integration tests.
+
+```xml
+<!-- pom.xml -->
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>rabbitmq</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+```java
+@SpringBootTest
+@Testcontainers
+class InventoryConsumerIT {
+
+    @Container
+    static RabbitMQContainer rabbitMQ = new RabbitMQContainer("rabbitmq:3-management");
+
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.rabbitmq.host", rabbitMQ::getHost);
+        registry.add("spring.rabbitmq.port", rabbitMQ::getAmqpPort);
+    }
+
+    @Autowired
+    private AmqpTemplate amqpTemplate;
+
+    @Test
+    void testOrderEventIsConsumed() throws Exception {
+        OrderEvent event = new OrderEvent("PENDING", "placed", new Order("ORD-1", "Phone", 1, 999.0));
+        amqpTemplate.convertAndSend("order.events.exchange", "order.placed.routing.key", event);
+
+        // Wait and verify side effects (DB state, log output, etc.)
+        await().atMost(5, SECONDS).untilAsserted(() ->
+            verify(inventoryService, times(1)).reduceStock("ORD-1"));
+    }
+}
+```
+
+---
+
+#### Q68. What is a global error handler for `@RabbitListener` and how do you configure one?
+
+**Answer:**
+Instead of wrapping every listener method in try-catch, configure a centralized error handler on the container factory.
+
+```java
+@Bean
+public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+        ConnectionFactory connectionFactory) {
+    SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
+    factory.setConnectionFactory(connectionFactory);
+    factory.setMessageConverter(jacksonMessageConverter());
+
+    // Global error handler — called for every listener method that throws
+    factory.setErrorHandler(t -> {
+        log.error("Unhandled error in RabbitMQ listener: {}", t.getMessage());
+        // t is ListenerExecutionFailedException wrapping the original
+        // message already NACKed by Spring — customize further here
+    });
+    return factory;
+}
+```
+
+For full control with DLX routing:
+```java
+factory.setAdviceChain(RetryInterceptorBuilder
+    .stateless()
+    .maxAttempts(3)
+    .recoverer(new RejectAndDontRequeueRecoverer()) // → DLX after 3 tries
+    .build());
+```
+
+---
+
+#### Q69. What changed in Spring AMQP 4.x that you must know?
+
+**Answer:**
+
+| Change | Old (3.x) | New (4.x) |
+|--------|-----------|-----------|
+| Message converter | `Jackson2JsonMessageConverter` | `JacksonJsonMessageConverter` (Jackson2 deprecated) |
+| Spring Boot version required | Spring Boot 2.x / 3.x | Spring Boot 3.x + |
+| Java version | Java 8+ | Java 17+ (records, sealed classes supported in DTOs) |
+| Publisher confirm type | `publisher-confirms: true` | `publisher-confirm-type: correlated` |
+| `@RabbitListener` queue expression | SpEL `#{@bean.name}` works | Still works, `${property}` preferred |
+
+---
+
+#### Q70. How would you implement a fan-out notification system for multiple channels (email, SMS, push)?
+
+**Answer:**
+
+Use a **Fanout Exchange** — it broadcasts to all bound queues regardless of routing key.
+
+```java
+// Config in notification-service or a shared producer
+@Bean
+public FanoutExchange notificationExchange() {
+    return new FanoutExchange("notification.fanout.exchange");
+}
+
+@Bean
+public Queue emailQueue() { return new Queue("notification.email.queue"); }
+
+@Bean
+public Queue smsQueue() { return new Queue("notification.sms.queue"); }
+
+@Bean
+public Queue pushQueue() { return new Queue("notification.push.queue"); }
+
+@Bean
+public Binding emailBinding() {
+    return BindingBuilder.bind(emailQueue()).to(notificationExchange()); // no routing key needed
+}
+// same for sms and push bindings
+```
+
+**Publish once, all three queues receive:**
+```java
+amqpTemplate.convertAndSend("notification.fanout.exchange", "", notificationEvent);
+// routing key ignored by fanout
+```
+
+**Each consumer:**
+```java
+@RabbitListener(queues = "notification.email.queue")
+public void sendEmail(NotificationEvent event) { ... }
+
+@RabbitListener(queues = "notification.sms.queue")
+public void sendSms(NotificationEvent event) { ... }
+```
+
+---
+
+#### Q71. What is the difference between `@RabbitListener(queues=...)` and `@RabbitListener(bindings=...)`?
+
+**Answer:**
+
+| | `queues = "..."` | `bindings = @QueueBinding(...)` |
+|--|------------------|---------------------------------|
+| What it does | Listens to an existing queue (queue must already exist) | Declares the queue + exchange + binding automatically |
+| Queue creation | Manual (via `@Bean` or RabbitAdmin) | Automatic — Spring creates it if not exists |
+| Flexibility | More explicit — recommended for production | Convenient — good for development/testing |
+
+```java
+// Option 1: queue already declared as @Bean
+@RabbitListener(queues = "${rabbitmq.queue.order.name}")
+public void consume(OrderEvent event) { ... }
+
+// Option 2: Spring auto-declares exchange, queue, and binding
+@RabbitListener(bindings = @QueueBinding(
+    value = @Queue(value = "order.placed.queue", durable = "true"),
+    exchange = @Exchange(value = "order.events.exchange", type = ExchangeTypes.TOPIC),
+    key = "order.placed.routing.key"
+))
+public void consume(OrderEvent event) { ... }
+```
+
+---
+
+#### Q72. How do you implement consumer group patterns in RabbitMQ (like Kafka consumer groups)?
+
+**Answer:**
+RabbitMQ does not have native "consumer groups" — but you achieve the same behavior through queue design.
+
+**Kafka consumer group equivalent: competing consumers on one queue**
+```
+Queue: order.placed.queue
+  → Instance 1 of inventory-service
+  → Instance 2 of inventory-service   ← only ONE processes each message
+  → Instance 3 of inventory-service
+```
+This is the default RabbitMQ competing consumer pattern.
+
+**Independent consumers (each gets all messages — like Kafka without groups):**
+```
+Exchange: order.events.exchange
+  → inventory.order.queue    → all inventory instances share this
+  → analytics.order.queue    → all analytics instances share this
+```
+
+Each service has its own queue. Within a service, all instances compete on the same queue.
+
+> RabbitMQ is inherently pull-based (consumers pull from queues), which naturally gives you consumer-group-like isolation between different services.
+
+---
+
+### Section J — Architecture & System Design Questions
+
+---
+
+#### Q73. How would you design a RabbitMQ topology for a ride-sharing platform?
+
+**Answer:**
+
+```
+ride.exchange (Topic)
+  ride.requested.key   → driver.matching.queue   → DriverMatchingService
+  ride.requested.key   → notification.queue      → NotificationService (rider confirmation)
+  ride.accepted.key    → tracking.queue          → TrackingService
+  ride.accepted.key    → payment.hold.queue      → PaymentService (pre-auth)
+  ride.completed.key   → payment.charge.queue    → PaymentService (charge)
+  ride.completed.key   → rating.queue            → RatingService
+  ride.cancelled.key   → payment.refund.queue    → PaymentService (release hold)
+  ride.cancelled.key   → notification.queue      → NotificationService (cancellation)
+
+location.exchange (Topic, high frequency)
+  location.update.*    → driver.location.queue   → LocationCacheService
+```
+
+**Key design choices:**
+- `ride.exchange` for business events (low frequency, durable)
+- `location.exchange` for GPS pings (high frequency, possibly transient)
+- Separate exchanges to avoid mixing different SLA requirements
+
+---
+
+#### Q74. How does RabbitMQ fit into a CQRS architecture?
+
+**Answer:**
+**CQRS** (Command Query Responsibility Segregation) separates writes (commands) from reads (queries).
+
+RabbitMQ naturally fits the **command side**:
+
+```
+Command Handler
+    │
+    ├── Writes to write DB (PostgreSQL)
+    └── Publishes DomainEvent → RabbitMQ
+            │
+            ├── Read Model Updater (Consumer) → updates read DB (Elasticsearch)
+            └── Notification Service (Consumer) → sends alerts
+```
+
+**Flow:**
+1. `PlaceOrderCommand` → OrderService writes order to PostgreSQL
+2. OrderService publishes `OrderPlacedEvent` to RabbitMQ
+3. ReadModelUpdater consumes event → updates Elasticsearch index
+4. Frontend queries Elasticsearch (fast reads)
+
+---
+
+#### Q75. What is event sourcing and how does RabbitMQ relate to it?
+
+**Answer:**
+**Event Sourcing** stores the state of a system as a sequence of immutable events (not current state).
+
+**RabbitMQ's role:**
+- Publishes domain events to subscribers after they are stored in the event store
+- Fans out events to multiple projections (read models)
+
+**Important distinction:**
+- RabbitMQ **is not** an event store — messages are deleted after ACK
+- The event store is typically a database (EventStoreDB, PostgreSQL with append-only table)
+- RabbitMQ is the **event bus** — it broadcasts stored events to interested services
+
+```
+Client → OrderService → EventStore (DB) → publishes → RabbitMQ
+                                              │
+                                    ┌─────────┼──────────┐
+                              InventoryProjection   OrderHistoryProjection
+```
+
+---
+
+### Quick Reference — 75 Questions Summary
 
 | # | Topic | Key Point |
 |---|-------|-----------|
@@ -1839,6 +2590,21 @@ rabbitTemplate.setReturnsCallback(returned -> {
 | 58 | Priority queues | x-max-priority + MessageProperties.setPriority |
 | 59 | Unroutable messages | Alternate Exchange or mandatory flag |
 | 60 | Shovel vs Federation vs Replication | Migration vs routing vs HA |
+| 61 | AmqpRejectAndDontRequeueException | Reject without requeue — cleaner than channel.basicNack |
+| 62 | @RabbitHandler | Polymorphic consumer — dispatch by message type |
+| 63 | Spring retry vs DLX retry | In-memory fast retry vs stateful disk-based retry |
+| 64 | Batch processing | List<> in @RabbitListener — bulk DB writes |
+| 65 | CachingConnectionFactory modes | CHANNEL (default) vs CONNECTION |
+| 66 | Simple vs DirectMessageListenerContainer | Thread pool vs nio consumer threads |
+| 67 | Testing with TestContainers | Real RabbitMQ in integration tests |
+| 68 | Global error handler | Factory-level error handler — no per-listener try-catch |
+| 69 | Spring AMQP 4.x changes | Jackson2 deprecated, Java 17+, new confirm type |
+| 70 | Fanout notification system | One exchange → email + SMS + push queues |
+| 71 | @RabbitListener queues vs bindings | Existing queue vs auto-declare |
+| 72 | Consumer group pattern | Same queue = competing consumers; own queue = independent |
+| 73 | Ride-sharing topology | Multiple exchanges by frequency and SLA |
+| 74 | CQRS with RabbitMQ | Commands → write DB + event bus → read model update |
+| 75 | Event sourcing with RabbitMQ | Event store = DB; RabbitMQ = event bus; not the store |
 
 ---
 

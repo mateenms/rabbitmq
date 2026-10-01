@@ -4,6 +4,251 @@ A detailed guide to understand the design, message flow, and RabbitMQ topology o
 
 ---
 
+## Part 1 — RabbitMQ Core Concepts (Theory First)
+
+Before looking at the code, understand these 4 building blocks. Every RabbitMQ integration is just a combination of these.
+
+---
+
+### 1. Queue
+
+A **Queue** is a buffer that stores messages until a consumer picks them up.
+
+- Messages sit in the queue in order (FIFO)
+- A queue is **durable** (survives RabbitMQ restart) or **transient** (lost on restart)
+- Only **one consumer** processes each message (point-to-point)
+
+```
+Producer → [  msg1  msg2  msg3  ] Queue → Consumer
+```
+
+**In Spring Boot:**
+```java
+@Bean
+public Queue orderQueue() {
+    return new Queue("order.placed.queue"); // durable by default
+}
+```
+
+---
+
+### 2. Exchange
+
+A **Exchange** receives messages from producers and routes them to queues. The producer **never sends directly to a queue** — it always sends to an exchange.
+
+There are 4 types:
+
+| Type | How it routes |
+|------|--------------|
+| **Direct** | Exact match on routing key |
+| **Topic** | Pattern match on routing key (`*` = one word, `#` = zero or more) |
+| **Fanout** | Ignores routing key — sends to ALL bound queues |
+| **Headers** | Routes by message headers, not routing key |
+
+> This project uses **TopicExchange** — flexible and industry standard.
+
+**In Spring Boot:**
+```java
+@Bean
+public TopicExchange orderExchange() {
+    return new TopicExchange("order.events.exchange");
+}
+```
+
+---
+
+### 3. Routing Key
+
+A **Routing Key** is a string label the producer attaches to the message when sending to the exchange. The exchange uses it to decide which queue(s) get the message.
+
+Think of it like a **postal code** — the exchange is the post office that reads it and decides where to deliver.
+
+```
+Producer → Exchange (reads routing key) → correct Queue
+```
+
+Examples used in this project:
+```
+order.placed.routing.key       → routes to order.placed.queue
+inventory.update.routing.key   → routes to inventory.update.queue
+notification.send.routing.key  → routes to notification.send.queue
+```
+
+---
+
+### 4. Binding
+
+A **Binding** is the link between an exchange and a queue. It says:
+> "When a message with THIS routing key arrives at THIS exchange, send it to THIS queue."
+
+Without a binding, the exchange doesn't know which queues exist.
+
+```
+Exchange ──[binding: routing key]──▶ Queue
+```
+
+**In Spring Boot:**
+```java
+@Bean
+public Binding orderQueueBinding() {
+    return BindingBuilder
+        .bind(orderQueue())          // which queue
+        .to(orderExchange())         // to which exchange
+        .with(orderPlacedRoutingKey); // when routing key matches
+}
+```
+
+---
+
+### How It All Connects
+
+```
+                    ┌─────────────────────────────────┐
+Producer            │         EXCHANGE                 │
+sends message  ───▶ │   (reads the routing key)        │
+with routing key    │                                  │
+                    └──────┬──────────────┬────────────┘
+                           │              │
+                    [binding A]      [binding B]
+                     routing key      routing key
+                           │              │
+                    ┌──────▼───┐   ┌──────▼──────┐
+                    │  Queue A │   │   Queue B   │
+                    └──────────┘   └─────────────┘
+                         │                │
+                    Consumer A       Consumer B
+```
+
+---
+
+### Step-by-Step: How to Configure in Each Service
+
+#### Step 1 — Define the Exchange (order-service only — producer declares it)
+```java
+@Bean
+public TopicExchange orderExchange() {
+    return new TopicExchange("order.events.exchange");
+}
+```
+
+#### Step 2 — Define Queues (one per consumer service)
+```java
+@Bean
+public Queue orderQueue() {
+    return new Queue("order.placed.queue");
+}
+
+@Bean
+public Queue inventoryQueue() {
+    return new Queue("inventory.update.queue");
+}
+
+@Bean
+public Queue notificationQueue() {
+    return new Queue("notification.send.queue");
+}
+```
+
+#### Step 3 — Bind Each Queue to the Exchange with a Routing Key
+```java
+@Bean
+public Binding orderQueueBinding() {
+    return BindingBuilder.bind(orderQueue())
+        .to(orderExchange())
+        .with("order.placed.routing.key");
+}
+
+@Bean
+public Binding inventoryQueueBinding() {
+    return BindingBuilder.bind(inventoryQueue())
+        .to(orderExchange())
+        .with("inventory.update.routing.key");
+}
+
+@Bean
+public Binding notificationQueueBinding() {
+    return BindingBuilder.bind(notificationQueue())
+        .to(orderExchange())
+        .with("notification.send.routing.key");
+}
+```
+
+#### Step 4 — Configure Message Converter (JSON support)
+```java
+@Bean
+public MessageConverter jacksonMessageConverter() {
+    return new JacksonJsonMessageConverter(); // Java object ↔ JSON
+}
+```
+
+#### Step 5 — Configure RabbitTemplate (producer only)
+```java
+@Bean
+public AmqpTemplate amqpTemplate(ConnectionFactory connectionFactory) {
+    RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
+    rabbitTemplate.setMessageConverter(jacksonMessageConverter());
+    return rabbitTemplate;
+}
+```
+
+#### Step 6 — Force Declaration on Startup (producer only)
+Without this, queues only appear in RabbitMQ after a consumer connects.
+```java
+@Bean
+public RabbitAdmin rabbitAdmin(ConnectionFactory connectionFactory) {
+    return new RabbitAdmin(connectionFactory);
+}
+
+@Bean
+public ApplicationRunner rabbitInitializer(RabbitAdmin rabbitAdmin) {
+    return args -> rabbitAdmin.initialize(); // declares all beans on startup
+}
+```
+
+#### Step 7 — Publish a Message (producer)
+```java
+amqpTemplate.convertAndSend(exchangeName, routingKey, orderEvent);
+// exchange routes the message to the correct queue based on routing key
+```
+
+#### Step 8 — Consume a Message (consumer service)
+```java
+@RabbitListener(queues = "${rabbitmq.queue.notification.name}")
+public void consumeOrderEvent(OrderEvent orderEvent) {
+    // Spring automatically deserializes the JSON back to OrderEvent object
+}
+```
+
+---
+
+### Consumer Service Configuration (Minimal)
+
+Consumer services only need the **message converter** — they don't declare the exchange or bindings (the producer owns that):
+
+```java
+@Configuration
+public class RabbitMQConfig {
+
+    @Bean
+    public MessageConverter jacksonMessageConverter() {
+        return new JacksonJsonMessageConverter();
+    }
+
+    @Bean
+    public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+            ConnectionFactory connectionFactory) {
+        SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
+        factory.setConnectionFactory(connectionFactory);
+        factory.setMessageConverter(jacksonMessageConverter());
+        return factory;
+    }
+}
+```
+
+---
+
+
+
 ## Overview
 
 When a client places an order, the **order-service** publishes an event to a RabbitMQ **TopicExchange**. The exchange routes the event to multiple queues based on routing keys. Each consumer service (inventory-service, notification-service) independently picks up the event from its own queue and processes it — with no knowledge of each other.

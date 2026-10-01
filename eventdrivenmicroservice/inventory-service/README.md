@@ -83,3 +83,18 @@ inventory-service/
 ## Author
 
 **Mohammad Mateen**
+
+Full Stack Java Developer | Microservices Architect | AWS Certified Solutions Architect
+
+Experienced in designing and building scalable, cloud-native enterprise applications using Java, Spring Boot, and microservices architecture. Passionate about event-driven systems, distributed computing, and clean software design.
+
+**Core Expertise:**
+- Java & Spring Boot (REST APIs, Spring AMQP, Spring Security, Spring Data)
+- Microservices Architecture & Event-Driven Design (RabbitMQ, Kafka)
+- AWS Cloud Solutions (Certified Solutions Architect)
+- Full Stack Development (React, Angular, REST, GraphQL)
+- Containerization & Orchestration (Docker, Kubernetes)
+- CI/CD Pipelines & DevOps practices
+
+📧 javamateen@gmail.com
+🔗 [GitHub](https://github.com/mateenms)

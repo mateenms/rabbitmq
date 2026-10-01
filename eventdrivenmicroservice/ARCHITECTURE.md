@@ -2526,6 +2526,547 @@ Client → OrderService → EventStore (DB) → publishes → RabbitMQ
 
 ---
 
+### Section K — Critical Gaps (Topics Every Senior Must Know)
+
+---
+
+#### Q76. What is the difference between AMQP Transactions and Publisher Confirms?
+
+**Answer:**
+Both guarantee message delivery — but they work very differently.
+
+**AMQP Transactions (`tx.select` / `tx.commit`):**
+```java
+channel.txSelect();
+channel.basicPublish(exchange, routingKey, null, body);
+channel.txCommit(); // sync — broker confirms to disk before returning
+```
+- Synchronous — each `txCommit` blocks until the broker has fully persisted the message
+- Very slow — ~250x slower than publisher confirms
+- Rarely used in practice
+
+**Publisher Confirms:**
+```java
+channel.confirmSelect();
+channel.basicPublish(exchange, routingKey, null, body);
+channel.waitForConfirmsOrDie(5000); // wait up to 5s for broker ACK
+```
+- Asynchronous — broker sends lightweight ACK after storing
+- Much faster — ~10x throughput vs transactions
+- The correct choice for reliable publishing
+
+> **Interview trap:** "Use transactions for reliability." Wrong — use Publisher Confirms. Transactions are for grouping multiple publishes atomically, which is a different (rare) need.
+
+| | AMQP Transactions | Publisher Confirms |
+|--|-------------------|--------------------|
+| Speed | ~250 msg/s | ~50,000 msg/s |
+| Use case | Atomic batch publish | Reliable single publish |
+| Spring AMQP | `setChannelTransacted(true)` | `publisher-confirm-type: correlated` |
+
+---
+
+#### Q77. What is the Delayed Message Exchange plugin and how do you use it?
+
+**Answer:**
+The **rabbitmq_delayed_message_exchange** plugin allows you to delay message delivery by a configurable number of milliseconds.
+
+**Use cases:**
+- Retry with exponential backoff (delay 1s, 2s, 4s, 8s)
+- Scheduled notifications (send reminder in 24 hours)
+- Deferred processing (process payment 1 hour after order)
+
+**Setup:**
+```bash
+# Enable the plugin
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+```
+
+**Spring Boot config:**
+```java
+@Bean
+public CustomExchange delayedExchange() {
+    Map<String, Object> args = new HashMap<>();
+    args.put("x-delayed-type", "direct"); // underlying exchange type
+    return new CustomExchange("order.delayed.exchange", "x-delayed-message", true, false, args);
+}
+
+// Publish with delay
+MessagePostProcessor delay = message -> {
+    message.getMessageProperties().setDelay(5000); // delay 5 seconds
+    return message;
+};
+amqpTemplate.convertAndSend("order.delayed.exchange", "order.retry.key", event, delay);
+```
+
+> This is better than the TTL+DLX retry pattern because delay is per-message and the message stays in the delayed exchange until the delay passes — it doesn't consume queue space on the main queue.
+
+---
+
+#### Q78. How do you handle schema evolution / event versioning when DTOs change?
+
+**Answer:**
+When a producer changes its DTO, consumers that have the old DTO shape will break — unless you design for it.
+
+**Rule 1 — Additive changes are safe (backward compatible):**
+```java
+// Producer adds new field — old consumers just ignore it (Jackson ignores unknown fields)
+public class OrderEvent {
+    private String orderId;
+    private String name;
+    private double price;
+    private String promoCode; // ← new field: old consumers skip it safely
+}
+```
+
+**Rule 2 — Never remove or rename a field without a migration plan:**
+```java
+// ❌ Dangerous — consumer DTO still has 'name', producer renamed to 'itemName'
+// Consumer gets null for 'name'
+```
+
+**Rule 3 — Add `@JsonIgnoreProperties(ignoreUnknown = true)` to all consumer DTOs:**
+```java
+@JsonIgnoreProperties(ignoreUnknown = true) // ← tolerates producer adding new fields
+@Data
+public class OrderEvent {
+    private String orderId;
+    private String name;
+}
+```
+
+**Rule 4 — Use explicit versioning for breaking changes:**
+```
+// Option A: versioned queues
+order.placed.v1.queue  → old consumers
+order.placed.v2.queue  → new consumers
+
+// Option B: version in routing key
+order.placed.v1.routing.key
+order.placed.v2.routing.key
+```
+
+**Rule 5 — Never share DTOs between services as a library:**
+- Each service owns its own DTO copy
+- This forces you to be explicit about what each service cares about
+
+---
+
+#### Q79. Why does `@Transactional` NOT protect you from dual-write failures with RabbitMQ?
+
+**Answer:**
+This is one of the most dangerous misunderstandings in microservices development.
+
+**What people think:**
+```java
+@Transactional
+public void placeOrder(OrderDTO dto) {
+    orderRepository.save(toOrder(dto));         // DB write
+    amqpTemplate.convertAndSend(exchange, key, event); // RabbitMQ publish
+    // "if an exception is thrown, both roll back"  ← WRONG
+}
+```
+
+**What actually happens:**
+- `@Transactional` wraps ONLY the database transaction (via JDBC)
+- RabbitMQ uses a separate TCP channel — it is NOT enlisted in the Spring transaction
+- If DB write succeeds and then `convertAndSend` throws → DB is committed, RabbitMQ message lost
+- If DB write fails after `convertAndSend` succeeds → message published, DB rolled back = **ghost event**
+
+**The correct solution — Outbox Pattern:**
+```java
+@Transactional
+public void placeOrder(OrderDTO dto) {
+    orderRepository.save(toOrder(dto));
+    outboxRepository.save(new OutboxEvent("OrderPlaced", toJson(dto))); // ← same DB tx
+    // No RabbitMQ call here
+}
+
+// Separate background job (e.g. @Scheduled every 1s):
+@Scheduled(fixedDelay = 1000)
+public void publishPendingEvents() {
+    outboxRepository.findUnpublished().forEach(event -> {
+        amqpTemplate.convertAndSend(exchange, key, fromJson(event.getPayload()));
+        event.setPublished(true);
+        outboxRepository.save(event);
+    });
+}
+```
+
+> You CAN make Spring AMQP participate in a transaction by setting `setChannelTransacted(true)` on `RabbitTemplate` — but this uses the slow AMQP transaction protocol and still doesn't span the DB transaction. Outbox is the reliable pattern.
+
+---
+
+#### Q80. What is the difference between `basicNack` and `basicReject`?
+
+**Answer:**
+
+| Method | Multiple messages? | Signature |
+|--------|-------------------|-----------|
+| `basicReject` | No — one message only | `basicReject(deliveryTag, requeue)` |
+| `basicNack` | Yes — optionally bulk | `basicNack(deliveryTag, multiple, requeue)` |
+
+```java
+// Reject one message
+channel.basicReject(deliveryTag, false); // false = don't requeue → DLX
+
+// NACK one message (same effect as basicReject when multiple=false)
+channel.basicNack(deliveryTag, false, false);
+
+// NACK ALL unacknowledged messages up to this delivery tag
+channel.basicNack(deliveryTag, true, false); // multiple=true
+```
+
+> **Rule:** Use `basicNack` with `multiple = false` for fine-grained control per message. Use `multiple = true` only when you want to reject a batch in one call.
+
+---
+
+#### Q81. What is bulk ACKing (multiple = true) and when should you use it?
+
+**Answer:**
+When a consumer ACKs with `multiple = true`, the broker acknowledges **all messages up to and including** that delivery tag in one round-trip.
+
+```java
+// Process a batch in memory, then ACK all at once
+List<Long> deliveryTags = new ArrayList<>();
+
+for (Message msg : batch) {
+    process(msg);
+    deliveryTags.add(msg.getMessageProperties().getDeliveryTag());
+}
+
+// ACK the last delivery tag with multiple=true → all previous tags also ACKed
+long lastTag = deliveryTags.get(deliveryTags.size() - 1);
+channel.basicAck(lastTag, true); // one network round-trip instead of N
+```
+
+**When to use:** High-throughput batch consumers where N individual ACKs create noticeable network overhead.
+
+**Risk:** If the consumer crashes after processing 8 of 10 messages in the batch, all 10 are redelivered (you only ACKed the last one). Design consumers to be idempotent when using bulk ACKing.
+
+---
+
+#### Q82. What is distributed tracing with RabbitMQ? How do you propagate trace IDs?
+
+**Answer:**
+When an HTTP request triggers an order, and that order fans out to 3 services via RabbitMQ, you need to trace the full journey with one correlation ID.
+
+**Without tracing:** You see 3 disconnected log entries with no way to correlate them.
+
+**With tracing:** All 3 logs share the same `traceId`, giving you end-to-end visibility.
+
+**Spring Cloud Sleuth / Micrometer Tracing approach:**
+```java
+// Producer — add trace context to message headers
+MessagePostProcessor tracePostProcessor = message -> {
+    message.getMessageProperties().setHeader("X-B3-TraceId", tracer.currentSpan().context().traceId());
+    message.getMessageProperties().setHeader("X-B3-SpanId", tracer.currentSpan().context().spanId());
+    return message;
+};
+amqpTemplate.convertAndSend(exchange, key, event, tracePostProcessor);
+
+// Consumer — extract and continue the trace
+@RabbitListener(queues = "order.placed.queue")
+public void consume(OrderEvent event,
+        @Header(value = "X-B3-TraceId", required = false) String traceId,
+        @Header(value = "X-B3-SpanId", required = false) String parentSpanId) {
+    // Spring Cloud Sleuth auto-extracts these and continues the trace
+    log.info("TraceId: {} — processing order: {}", traceId, event.getOrder().getOrderId());
+}
+```
+
+**With Spring Boot 3.x + Micrometer Tracing + Zipkin:**
+- Auto-instrumented — Micrometer propagates B3 headers automatically through `RabbitTemplate`
+- No manual header handling needed if you add `spring-cloud-starter-sleuth` or `micrometer-tracing-bridge-brave`
+
+---
+
+#### Q83. What are the essential RabbitMQ plugins and what does each do?
+
+**Answer:**
+
+| Plugin | Purpose | Enable Command |
+|--------|---------|---------------|
+| `rabbitmq_management` | Web UI + REST API (port 15672) | Default in management image |
+| `rabbitmq_prometheus` | Exposes `/metrics` for Prometheus scraping | `rabbitmq-plugins enable rabbitmq_prometheus` |
+| `rabbitmq_shovel` | Move messages between queues/brokers | `rabbitmq-plugins enable rabbitmq_shovel` |
+| `rabbitmq_shovel_management` | UI for managing shovels | Requires shovel plugin |
+| `rabbitmq_federation` | Link exchanges/queues across brokers | `rabbitmq-plugins enable rabbitmq_federation` |
+| `rabbitmq_delayed_message_exchange` | Delay message delivery by N ms | Manual download required |
+| `rabbitmq_auth_mechanism_ssl` | x509 certificate authentication | `rabbitmq-plugins enable rabbitmq_auth_mechanism_ssl` |
+| `rabbitmq_consistent_hash_exchange` | Route based on hash of routing key (sticky routing) | `rabbitmq-plugins enable rabbitmq_consistent_hash_exchange` |
+
+**Enable multiple plugins at once:**
+```bash
+rabbitmq-plugins enable rabbitmq_management rabbitmq_prometheus rabbitmq_shovel
+```
+
+**In Docker:**
+```dockerfile
+FROM rabbitmq:3-management
+RUN rabbitmq-plugins enable --offline rabbitmq_prometheus
+```
+
+---
+
+#### Q84. What are the common anti-patterns with RabbitMQ you must avoid?
+
+**Answer:**
+
+| Anti-Pattern | Problem | Fix |
+|--------------|---------|-----|
+| **Shared queue for different event types** | Consumer must check message type — messy, hard to scale | One queue per event type |
+| **Consumer calls another service synchronously inside @RabbitListener** | Slow dependency makes consumer block — queue backs up | Use async or fire another event |
+| **Using RabbitMQ as a database** | Messages deleted on ACK — no audit, no replay | Use a proper DB for state; RabbitMQ for events |
+| **No DLX configured** | Failed messages silently lost | Always configure DLX in production |
+| **Auto-ACK in production** | Any consumer crash loses messages permanently | Always use manual ACK for important messages |
+| **Guest user in production** | Security vulnerability + guest is blocked from remote hosts | Dedicated users with minimal permissions |
+| **Publishing inside a `@Transactional` method without Outbox** | Ghost events or lost events on crash | Use Outbox pattern |
+| **Hardcoded queue names in Java code** | Cannot change names for different environments | Externalize to `application.yaml` with `${...}` |
+| **Single consumer for all queues with slow processing** | Queue depth grows unbounded under load | Scale consumers + set prefetch + max-length |
+| **Infinite requeue on failure (requeue=true always)** | Poison message loops block the queue permanently | Retry counter + DLX after N retries |
+| **Publishing very large messages (>100KB)** | Memory pressure on broker, slow delivery | Use reference pattern: store file in S3, publish just the ID |
+| **One exchange for everything** | No domain separation, routing becomes complex | One exchange per bounded context / domain |
+
+---
+
+#### Q85. What is the message reference pattern for large payloads?
+
+**Answer:**
+Never put large files (PDFs, images, binary data) inside a RabbitMQ message. Messages are held in memory and large messages exhaust the broker.
+
+**The reference pattern:**
+```
+1. Producer uploads file to S3/MinIO/Azure Blob
+2. Producer publishes a lightweight event with just the file reference:
+{
+  "orderId": "ORD-001",
+  "documentUrl": "s3://my-bucket/orders/ORD-001/invoice.pdf",
+  "documentType": "INVOICE"
+}
+3. Consumer receives lightweight event, downloads file from S3 when needed
+```
+
+**Rule of thumb:**
+- Message body < 64KB → safe to include inline
+- Message body > 64KB → use reference pattern
+
+---
+
+#### Q86. How do you unit test code that publishes to RabbitMQ without a real broker?
+
+**Answer:**
+Use `@MockBean` to mock `AmqpTemplate` in Spring Boot unit tests:
+
+```java
+@SpringBootTest
+class OrderControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockBean
+    private AmqpTemplate amqpTemplate; // ← no real RabbitMQ needed
+
+    @Test
+    void placeOrder_shouldPublishEvent() throws Exception {
+        mockMvc.perform(post("/api/v1/orders")
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("""
+                {"orderId":"ORD-001","name":"iPhone","quantity":1,"price":999.99}
+            """))
+            .andExpect(status().isOk());
+
+        // Verify amqpTemplate.convertAndSend was called with correct args
+        verify(amqpTemplate, times(1)).convertAndSend(
+            eq("order.events.exchange"),
+            eq("order.placed.routing.key"),
+            any(OrderEvent.class)
+        );
+    }
+
+    @Test
+    void placeOrder_whenRabbitMQDown_shouldReturn500() throws Exception {
+        doThrow(new AmqpException("Connection refused"))
+            .when(amqpTemplate).convertAndSend(anyString(), anyString(), any());
+
+        mockMvc.perform(post("/api/v1/orders")
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("""
+                {"orderId":"ORD-001","name":"iPhone","quantity":1,"price":999.99}
+            """))
+            .andExpect(status().isInternalServerError());
+    }
+}
+```
+
+---
+
+#### Q87. What is the RabbitMQ Management REST API and what can you do with it?
+
+**Answer:**
+RabbitMQ exposes a full HTTP REST API at `http://localhost:15672/api/`. You can manage the entire broker programmatically.
+
+**Common endpoints:**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/queues` | GET | List all queues with depth, consumer count, rates |
+| `/api/queues/{vhost}/{name}` | DELETE | Delete a specific queue |
+| `/api/exchanges` | GET | List all exchanges |
+| `/api/bindings` | GET | List all bindings |
+| `/api/connections` | GET | List active connections |
+| `/api/messages/{vhost}/{queue}` | POST | Peek at messages without consuming (for debugging) |
+| `/api/overview` | GET | Broker-wide stats (total messages, rates) |
+| `/api/healthchecks/node` | GET | Returns 200 if broker is healthy |
+
+**Example — check queue depth:**
+```bash
+curl -u guest:guest http://localhost:15672/api/queues/%2F/order.placed.queue \
+  | jq '.messages, .consumers'
+# Output: 42 (messages waiting), 3 (active consumers)
+```
+
+**Spring Boot integration:**
+```java
+// Check queue health programmatically
+String url = "http://localhost:15672/api/queues/%2F/order.placed.queue";
+QueueInfo info = restTemplate.getForObject(url, QueueInfo.class);
+if (info.getMessages() > 10000) {
+    alert("Queue backlog exceeded threshold");
+}
+```
+
+---
+
+#### Q88. What is a Consumer Tag and how do you use it?
+
+**Answer:**
+A **Consumer Tag** is a unique identifier assigned to a consumer when it subscribes to a queue. It is used to cancel (unsubscribe) a consumer.
+
+- Auto-generated by the broker if not specified: `amq.ctag-xXy1Z...`
+- Can be set manually for observability (easier to identify in Management UI)
+
+```java
+// In Spring AMQP — set a custom consumer tag via @RabbitListener
+@RabbitListener(
+    queues = "order.placed.queue",
+    id = "inventoryOrderConsumer"  // sets the Spring listener ID — consumer tag is derived
+)
+public void consume(OrderEvent event) { ... }
+
+// Via container directly
+SimpleMessageListenerContainer container = ...;
+container.setConsumerTagStrategy(queue -> "inventory-service-" + UUID.randomUUID());
+```
+
+**Why it matters in production:** In the Management UI, you see consumer tags. A clear naming convention like `inventory-service-prod-1` tells you immediately which service instance is consuming — vital for debugging.
+
+---
+
+#### Q89. What is `@EnableRabbit` and when do you need it?
+
+**Answer:**
+`@EnableRabbit` enables detection of `@RabbitListener` annotations on Spring beans.
+
+**In Spring Boot:** You do NOT need to add `@EnableRabbit` manually — Spring Boot's auto-configuration (`RabbitAutoConfiguration`) enables it automatically when `spring-boot-starter-amqp` is on the classpath.
+
+**When you DO need it:**
+- Plain Spring (not Spring Boot) applications
+- When you want to customize the `RabbitListenerAnnotationBeanPostProcessor` bean
+
+```java
+// Spring (non-Boot) application — required
+@Configuration
+@EnableRabbit
+public class RabbitMQConfig { ... }
+
+// Spring Boot — NOT needed (auto-configured)
+@Configuration
+public class RabbitMQConfig { ... } // ✅ @EnableRabbit is implicit
+```
+
+---
+
+#### Q90. Docker Compose — run the full stack locally
+
+**Answer:**
+Run all 3 services + RabbitMQ with a single `docker-compose up`:
+
+```yaml
+# docker-compose.yml (place in eventdrivenmicroservice/)
+version: "3.8"
+
+services:
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  order-service:
+    build: ./order-service
+    container_name: order-service
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_RABBITMQ_HOST: rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  inventory-service:
+    build: ./inventory-service
+    container_name: inventory-service
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_RABBITMQ_HOST: rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  notification-service:
+    build: ./notification-service
+    container_name: notification-service
+    ports:
+      - "8083:8083"
+    environment:
+      SPRING_RABBITMQ_HOST: rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+```
+
+```bash
+# Start everything
+docker-compose up --build
+
+# Stop everything
+docker-compose down
+
+# View logs for one service
+docker-compose logs -f order-service
+```
+
+**Add this Dockerfile to each service:**
+```dockerfile
+FROM eclipse-temurin:17-jre
+COPY target/*.jar app.jar
+ENTRYPOINT ["java", "-jar", "/app.jar"]
+```
+
+---
+
 ### Quick Reference — 75 Questions Summary
 
 | # | Topic | Key Point |
@@ -2605,6 +3146,21 @@ Client → OrderService → EventStore (DB) → publishes → RabbitMQ
 | 73 | Ride-sharing topology | Multiple exchanges by frequency and SLA |
 | 74 | CQRS with RabbitMQ | Commands → write DB + event bus → read model update |
 | 75 | Event sourcing with RabbitMQ | Event store = DB; RabbitMQ = event bus; not the store |
+| 76 | AMQP Transactions vs Publisher Confirms | Confirms are 250x faster — always prefer confirms |
+| 77 | Delayed Message Exchange plugin | Per-message delay, better than TTL+DLX for retries |
+| 78 | Schema evolution / event versioning | @JsonIgnoreProperties + additive changes + version routing keys |
+| 79 | @Transactional + RabbitMQ pitfall | They are NOT atomic — use Outbox Pattern |
+| 80 | basicNack vs basicReject | Reject = 1 msg; NACK = optionally many |
+| 81 | Bulk ACKing (multiple=true) | ACK all up to delivery tag in one round-trip |
+| 82 | Distributed tracing | B3 headers propagated via message properties |
+| 83 | RabbitMQ plugins | management, prometheus, shovel, federation, delayed, consistent-hash |
+| 84 | Common anti-patterns | 12 things not to do: shared queues, no DLX, auto-ACK, etc. |
+| 85 | Large payload reference pattern | Store in S3, publish only the URL/ID |
+| 86 | Unit testing with @MockBean | Mock AmqpTemplate — no real broker needed |
+| 87 | Management REST API | Programmatic queue depth checks, health, purge |
+| 88 | Consumer Tag | Unique consumer ID — set for observability in management UI |
+| 89 | @EnableRabbit | Spring Boot auto-configures it — only needed in plain Spring |
+| 90 | Docker Compose | Full stack: RabbitMQ + 3 services with healthcheck + depends_on |
 
 ---
 

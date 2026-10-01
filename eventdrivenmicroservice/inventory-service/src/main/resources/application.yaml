@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: inventory-service
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+
+server:
+  port: 8082
+
+rabbitmq:
+  exchange:
+    name: order.events.exchange
+  queue:
+    inventory:
+      name: inventory.update.queue
+    order:
+      name: order.placed.queue
+  routing:
+    key:
+      inventory: inventory.update.routing.key

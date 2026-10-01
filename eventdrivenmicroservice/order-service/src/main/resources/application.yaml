@@ -1,0 +1,27 @@
+spring:
+  application:
+    name: order-service
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+
+server:
+  port: 8081
+
+rabbitmq:
+  exchange:
+    name: order.events.exchange
+  queue:
+    order:
+      name: order.placed.queue
+    inventory:
+      name: inventory.update.queue
+    notification:
+      name: notification.send.queue
+  routing:
+    key:
+      order: order.placed.routing.key
+      inventory: inventory.update.routing.key
+      notification: notification.send.routing.key

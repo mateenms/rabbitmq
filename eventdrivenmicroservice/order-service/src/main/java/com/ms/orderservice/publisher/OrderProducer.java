@@ -3,6 +3,7 @@ package com.ms.orderservice.publisher;
 import com.ms.orderservice.dto.OrderEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.amqp.AmqpException;
 import org.springframework.amqp.core.AmqpTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -38,22 +39,24 @@ public class OrderProducer {
     }
 
     /**
-     * Publishes an OrderEvent to the exchange.
-     * inventory-service and notification-service consume this event independently.
+     * Publishes an OrderEvent to order, inventory and notification queues via the exchange.
+     * Throws AmqpException if RabbitMQ is unavailable.
      */
     public void sendOrderEvent(OrderEvent orderEvent) {
         LOGGER.info("Publishing order event -> orderId: {}, status: {}",
                 orderEvent.getOrder().getOrderId(),
                 orderEvent.getStatus());
-
-        amqpTemplate.convertAndSend(orderExchangeName, orderRoutingKey, orderEvent);
-       // amqpTemplate.convertAndSend(orderExchangeName, inventoryRoutingKey, orderEvent);
-
-        // send event order to notification queue
-        amqpTemplate.convertAndSend(orderExchangeName, notificationRoutingKey, orderEvent);
-
-        LOGGER.info("Order event published to order, inventory and notification queues for orderId: {}",
-                orderEvent.getOrder().getOrderId());
+        try {
+            amqpTemplate.convertAndSend(orderExchangeName, orderRoutingKey, orderEvent);
+            amqpTemplate.convertAndSend(orderExchangeName, inventoryRoutingKey, orderEvent);
+            amqpTemplate.convertAndSend(orderExchangeName, notificationRoutingKey, orderEvent);
+            LOGGER.info("Order event published to order, inventory and notification queues for orderId: {}",
+                    orderEvent.getOrder().getOrderId());
+        } catch (AmqpException e) {
+            LOGGER.error("Failed to publish order event for orderId: {} — {}",
+                    orderEvent.getOrder().getOrderId(), e.getMessage());
+            throw e;
+        }
     }
 
 }

@@ -1,18 +1,16 @@
 package com.ms.inventoryservice.config;
 
-import org.springframework.amqp.core.Queue;
 import org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.support.converter.JacksonJsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
  * RabbitMQ configuration for inventory-service.
- * Declares the inventory queue and sets Jackson as the message converter
- * so incoming JSON messages are automatically deserialized into OrderEvent.
+ * Sets Jackson as the message converter so incoming JSON messages
+ * are automatically deserialized into OrderEvent.
  *
  * @author Mohammad Mateen
  */

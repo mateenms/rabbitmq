@@ -21,7 +21,7 @@ public class InventoryConsumer {
      * Consumes OrderEvent from order.placed.queue.
      * Logs the order details and simulates a stock reduction.
      */
-    @RabbitListener(queues = "order.placed.queue")
+    @RabbitListener(queues = "${rabbitmq.queue.order.name}")
     public void consumeOrderEvent(OrderEvent orderEvent) {
         LOGGER.info("Inventory service received event from order.placed.queue");
         LOGGER.info("  Order ID  : {}", orderEvent.getOrder().getOrderId());
